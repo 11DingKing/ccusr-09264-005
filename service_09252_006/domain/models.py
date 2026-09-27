@@ -78,6 +78,25 @@ class PackageEntry:
 
 
 @dataclass
+class EntrySnapshot:
+    """清单条目关联其具体版本后的只读快照（复审包差异比较用）。
+
+    由持久化层 JOIN entries/versions 得到；version_no 与
+    supersedes_version_id 用于在差异中指明“来源版本/升级到第几版”。
+    """
+
+    package_id: str
+    material_id: str
+    version_id: str
+    sha256: str
+    kind: str
+    sensitivity: str
+    version_no: int
+    supersedes_version_id: Optional[str]
+    version_withdrawn: bool
+
+
+@dataclass
 class ReviewPackage:
     package_id: str
     institution_id: str

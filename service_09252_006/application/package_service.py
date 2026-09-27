@@ -19,7 +19,12 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..domain.fingerprint import manifest_fingerprint
-from ..domain.models import PackageEntry, ReviewPackage, User
+from ..domain.models import EntrySnapshot, PackageEntry, ReviewPackage, User
+from ..domain.package_diff import (
+    PackageRef,
+    diff_entry_snapshots,
+    summarize_diff,
+)
 from .base import Service, require_roles
 
 
@@ -238,6 +243,146 @@ class PackageService(Service):
             return self._package_dict(sealed)
 
         return self.idempotent(idempotency_key, work)
+
+    # -------------------------------------------------------------- 差异视图
+    def build_package_diff(
+        self,
+        actor: User,
+        *,
+        package_id: str,
+        against_package_id: str | None = None,
+    ) -> dict:
+        """只读查看复审包差异：target 包相对 base 来源包逐字段的
+        新增/删除/修改。
+
+        只读保证：不开事务、不写 audit/idempotency、不创建复审包、不推进
+        任何状态机——查看差异绝不会触发新的复审任务。base 缺省取 target
+        的 supersedes_package_id。敏感条目沿用最小披露：无权限时遮蔽
+        sha256 内容指纹与版本链细节。
+        """
+        target = self.repo.get_package(package_id)
+        if target is None:
+            raise NotFoundError("评审包不存在")
+        base_id = against_package_id or target.supersedes_package_id
+        if not base_id:
+            raise ValidationError(
+                "未指定被比较的来源包，且该包没有 supersedes_package_id",
+                details={"package_id": package_id},
+            )
+        if base_id == package_id:
+            raise ValidationError("不能比较评审包与其自身")
+        base = self.repo.get_package(base_id)
+        if base is None:
+            raise NotFoundError(
+                "被比较的来源评审包不存在",
+                details={"against_package_id": base_id},
+            )
+        self._require_view_package(actor, target)
+        self._require_view_package(actor, base)
+        if (
+            base.institution_id != target.institution_id
+            and not actor.has_role(Role.QUALITY_AUTHORITY)
+            and not actor.has_role(Role.AUDITOR)
+        ):
+            raise PermissionDeniedError("只能比较同一机构的评审包")
+
+        base_snapshots = self.repo.list_entry_snapshots(base_id)
+        target_snapshots = self.repo.list_entry_snapshots(package_id)
+        changes = diff_entry_snapshots(base_snapshots, target_snapshots)
+        # 计数在遮蔽前计算：数量不泄露内容，遮蔽只影响字段值
+        summary = summarize_diff(changes)
+        changes = self._redact_diff_changes(
+            actor, base, base_snapshots, target, target_snapshots, changes
+        )
+        return {
+            "base": PackageRef(
+                base.package_id,
+                base.status,
+                base.sealed_at,
+                base.manifest_fingerprint,
+            ).to_dict(),
+            "target": PackageRef(
+                target.package_id,
+                target.status,
+                target.sealed_at,
+                target.manifest_fingerprint,
+            ).to_dict(),
+            "summary": summary,
+            "changes": changes,
+            "read_only": True,
+            "viewer": actor.user_id,
+        }
+
+    def _require_view_package(self, actor: User, package: ReviewPackage) -> None:
+        """与包视图一致的查看权限：本机构 / 权威 / 审计 / 曾被分配的评审人。"""
+        is_assigned = actor.has_role(Role.REVIEWER) and any(
+            r.reviewer_id == actor.user_id
+            for r in self.repo.list_requests_by_package(package.package_id)
+        )
+        if (
+            actor.institution_id != package.institution_id
+            and not actor.has_role(Role.QUALITY_AUTHORITY)
+            and not actor.has_role(Role.AUDITOR)
+            and not is_assigned
+        ):
+            raise PermissionDeniedError("不能查看其他机构评审包")
+
+    def _redact_diff_changes(
+        self,
+        actor: User,
+        base: ReviewPackage,
+        base_snapshots: list[EntrySnapshot],
+        target: ReviewPackage,
+        target_snapshots: list[EntrySnapshot],
+        changes: list[dict],
+    ) -> list[dict]:
+        """按最小披露遮蔽差异中无权查看的内容指纹与版本链细节。"""
+        active = {
+            r.package_id
+            for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
+        }
+        ctx = DisclosureContext(actor, active)
+        visible_base = {
+            s.material_id: bool(ctx.can_see_entry(s, base))
+            for s in base_snapshots
+        }
+        visible_target = {
+            s.material_id: bool(ctx.can_see_entry(s, target))
+            for s in target_snapshots
+        }
+
+        def mask_ref(ref: dict, visible: bool) -> dict:
+            if visible:
+                return {**ref, "redacted": False}
+            masked = dict(ref)
+            # 与 redact_entry 同口径：仅保留材料存在/类别/敏感度，
+            # 不泄露内容摘要、版本序号与版本链指向
+            masked["sha256"] = None
+            masked["version_no"] = None
+            masked["supersedes_version_id"] = None
+            masked["withdrawn"] = None
+            masked["redacted"] = True
+            return masked
+
+        for row in changes:
+            mid = row["material_id"]
+            if row["change"] == "added":
+                row["entry"] = mask_ref(row["entry"], visible_target.get(mid, False))
+            elif row["change"] == "removed":
+                row["entry"] = mask_ref(row["entry"], visible_base.get(mid, False))
+            else:
+                row["from"] = mask_ref(row["from"], visible_base.get(mid, False))
+                row["to"] = mask_ref(row["to"], visible_target.get(mid, False))
+                for field_change in row["fields"]:
+                    if field_change["field"] != "sha256":
+                        continue
+                    if not visible_base.get(mid, False):
+                        field_change["base"]["value"] = None
+                        field_change["base"]["redacted"] = True
+                    if not visible_target.get(mid, False):
+                        field_change["target"]["value"] = None
+                        field_change["target"]["redacted"] = True
+        return changes
 
     # -------------------------------------------------------------- 视图
     def build_package_view(self, actor: User, package_id: str) -> dict:

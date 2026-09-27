@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EntrySnapshot,
     Material,
     MaterialVersion,
     Objection,
@@ -105,6 +106,10 @@ class Repository(abc.ABC):
 
     @abc.abstractmethod
     def entry_exists(self, package_id: str, version_id: str) -> bool: ...
+
+    @abc.abstractmethod
+    def list_entry_snapshots(self, package_id: str) -> list[EntrySnapshot]:
+        """只读：JOIN entries/versions 返回条目及其版本链信息（差异查看用）。"""
 
     @abc.abstractmethod
     def transition_package_status(

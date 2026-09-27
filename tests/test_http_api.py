@@ -192,6 +192,91 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(decision2["decision"], "approved")
         self.assertTrue(decision2["replayed"])
 
+    def test_package_diff_endpoint_is_read_only(self) -> None:
+        admin = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-admin"
+        )
+        authority = self._create_user(
+            "auth", ["quality_authority"], None, "tok-auth"
+        )
+        reviewer = self._create_user(
+            "rev-1", ["reviewer"], "inst-ext", "tok-rev"
+        )
+
+        def upload(data: bytes, title: str = "材料"):
+            status, mat = admin.request(
+                "POST", "/v1/materials",
+                {"kind": "syllabus", "title": title},
+            )
+            self.assertEqual(status, 201)
+            status, ver = admin.request(
+                "POST", f"/v1/materials/{mat['material_id']}/versions",
+                {"content_base64": base64.b64encode(data).decode("ascii")},
+            )
+            self.assertEqual(status, 201)
+            return mat, ver
+
+        mat, ver1 = upload("大纲 v1".encode("utf-8"))
+        status, pkg1 = admin.request("POST", "/v1/packages", {"title": "P1"})
+        pid1 = pkg1["package_id"]
+        status, _ = admin.request(
+            "POST", f"/v1/packages/{pid1}/entries",
+            {"version_id": ver1["version_id"]},
+        )
+        self.assertEqual(status, 201)
+        admin.request("POST", f"/v1/packages/{pid1}/seal", {})
+        status, req = authority.request(
+            "POST", f"/v1/packages/{pid1}/assignments",
+            {"reviewer_id": "rev-1"},
+        )
+        rid = req["request_id"]
+        reviewer.request("POST", f"/v1/requests/{rid}/respond", {"accept": True})
+        reviewer.request(
+            "POST", f"/v1/requests/{rid}/verdict", {"verdict": "approve"}
+        )
+        authority.request(
+            "POST", f"/v1/packages/{pid1}/decision", {"decision": "approved"}
+        )
+
+        # 派生复审包（自动带入旧条目）：差异为空
+        status, pkg2 = admin.request(
+            "POST", "/v1/packages",
+            {"title": "复审", "supersedes_package_id": pid1},
+        )
+        self.assertEqual(status, 201)
+        pid2 = pkg2["package_id"]
+        status, body = admin.request("GET", f"/v1/packages/{pid2}/diff")
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["summary"]["empty"])
+        self.assertEqual(body["changes"], [])
+        self.assertTrue(body["read_only"])
+        self.assertEqual(body["base"]["package_id"], pid1)
+        self.assertEqual(body["target"]["package_id"], pid2)
+
+        # 后补材料后：差异出现一条 added，指向新包来源版本
+        _, ver2 = upload("新增考核材料".encode("utf-8"), title="后补")
+        status, _ = admin.request(
+            "POST", f"/v1/packages/{pid2}/entries",
+            {"version_id": ver2["version_id"]},
+        )
+        self.assertEqual(status, 201)
+        status, body = admin.request(
+            "GET", f"/v1/packages/{pid2}/diff?against_package_id=" + pid1
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["summary"]["added"], 1)
+        added = body["changes"][0]
+        self.assertEqual(added["change"], "added")
+        self.assertEqual(added["entry"]["package_id"], pid2)
+        self.assertEqual(added["entry"]["version_id"], ver2["version_id"])
+
+        # GET 差异未改变任何包状态、未新建包
+        status, listed = admin.request("GET", "/v1/packages")
+        self.assertEqual(status, 200)
+        self.assertEqual({p["package_id"] for p in listed["packages"]}, {pid1, pid2})
+        status, view = admin.request("GET", f"/v1/packages/{pid2}")
+        self.assertEqual(view["status"], "draft")
+
     def test_health(self) -> None:
         status, body = ApiClient(self.base).request("GET", "/healthz")
         self.assertEqual(status, 200)

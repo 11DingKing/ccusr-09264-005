@@ -25,6 +25,20 @@
 - 后补材料走“复审包”：`supersedes_package_id` 指向旧包；旧包中**未撤回**
   的条目自动带入，已撤回条目不复制；旧包仅在 `decided` 后允许派生复审。
 
+### 复审包差异（只读）
+- `GET /v1/packages/{id}/diff`（缺省对比 `supersedes_package_id`，也可用
+  `?against_package_id=` 指定）逐字段列出相对来源包的
+  **新增 / 删除 / 修改**：条目按 `material_id` 配对，修改逐字段给出
+  `version_id / sha256 / kind / sensitivity` 的旧值与新值，字段口径与
+  封存清单指纹一致。
+- 结果同时指向两个来源版本（base/target 的 package_id、状态、封存时刻与
+  manifest_fingerprint；每条变化标注其来源包与具体 version_id）。
+- 差异计算是**纯只读**操作：领域层为无 IO 纯函数，仓储仅做
+  entries JOIN versions 的 SELECT；查看差异不开事务、不写审计/幂等表、
+  不创建包、不推进状态机，**绝不会触发新的复审任务**。
+- 敏感条目沿用最小披露：无权者只能看到材料存在/类别，内容指纹与版本链
+  指向被遮蔽。
+
 ### 材料撤回
 - 版本/材料撤回是追加标记，不删除任何已封存引用（历史可证）。
 - 撤回的版本不能进入新包、不能被复审包复制；离线核验会把
@@ -98,6 +112,7 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/packages/{id}/entries` | 草稿包追加版本 |
 | POST | `/v1/packages/{id}/seal` | 封存（固定清单指纹） |
 | GET  | `/v1/packages/{id}` | 包视图（敏感条目按权限遮蔽） |
+| GET  | `/v1/packages/{id}/diff` | 只读复审包差异（逐字段新增/删除/修改，可带 `against_package_id`） |
 | GET  | `/v1/packages/{id}/entries/{vid}/content` | 授权下载内容字节 |
 | POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止） |
 | GET  | `/v1/packages/{id}/requests` | 分配情况 |
@@ -118,7 +133,8 @@ python3 -m compileall -q service_09252_006 tests
 ```
 
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
-只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
+只能复审、**复审包差异**（空差异、逐字段新增/删除/修改、只读不触发复审、
+敏感遮蔽）、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
 多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
 端到端流程。

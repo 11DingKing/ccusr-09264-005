@@ -13,7 +13,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from ..application.container import ApplicationContext
 from ..domain.enums import Role
@@ -271,6 +271,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         actor = self._actor()
         self._send_json(200, self.services.packages.build_package_view(actor, package_id))
 
+    def get_package_diff(self, package_id: str) -> None:
+        actor = self._actor()
+        query = parse_qs(urlparse(self.path).query)
+        against = (query.get("against_package_id") or [None])[0]
+        # 只读端点：不产生 Idempotency-Key、不写审计、不触发复审
+        self._send_json(
+            200,
+            self.services.packages.build_package_diff(
+                actor,
+                package_id=package_id,
+                against_package_id=against,
+            ),
+        )
+
     def add_entry(self, package_id: str) -> None:
         actor = self._actor()
         body = self._read_json()
@@ -419,6 +433,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/versions/{version_id}", "get_version"),
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
+        ("/v1/packages/{package_id}/diff", "get_package_diff"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",

@@ -18,6 +18,7 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EntrySnapshot,
     Material,
     MaterialVersion,
     Objection,
@@ -482,6 +483,44 @@ class SqliteRepository(Repository):
             (package_id, version_id),
         ).fetchone()
         return row is not None
+
+    def list_entry_snapshots(self, package_id: str) -> list[EntrySnapshot]:
+        """只读关联查询：条目 JOIN 其具体版本，供复审包差异逐字段比较。
+
+        仅 SELECT，不开启事务、不写任何表（含 audit/idempotency）。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT e.package_id  AS package_id,
+                   e.material_id AS material_id,
+                   e.version_id  AS version_id,
+                   e.sha256      AS sha256,
+                   e.kind        AS kind,
+                   e.sensitivity AS sensitivity,
+                   v.version_no            AS version_no,
+                   v.supersedes_version_id AS supersedes_version_id,
+                   v.withdrawn             AS version_withdrawn
+            FROM entries e
+            JOIN versions v ON v.version_id = e.version_id
+            WHERE e.package_id = ?
+            ORDER BY e.material_id, e.version_id
+            """,
+            (package_id,),
+        ).fetchall()
+        return [
+            EntrySnapshot(
+                package_id=row["package_id"],
+                material_id=row["material_id"],
+                version_id=row["version_id"],
+                sha256=row["sha256"],
+                kind=row["kind"],
+                sensitivity=row["sensitivity"],
+                version_no=row["version_no"],
+                supersedes_version_id=row["supersedes_version_id"],
+                version_withdrawn=bool(row["version_withdrawn"]),
+            )
+            for row in rows
+        ]
 
     def transition_package_status(
         self,
