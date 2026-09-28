@@ -271,6 +271,30 @@ class ApiHandler(BaseHTTPRequestHandler):
         actor = self._actor()
         self._send_json(200, self.services.packages.build_package_view(actor, package_id))
 
+    def diff_package(self, package_id: str) -> None:
+        # 只读：查看两个版本的复审包差异，不创建任何复审任务
+        from urllib.parse import parse_qs
+
+        actor = self._actor()
+        query = parse_qs(urlparse(self.path).query)
+        base_values = query.get("base_package_id") or []
+        if not base_values or not base_values[0].strip():
+            from ..domain.errors import ValidationError
+
+            raise ValidationError(
+                "必须通过 base_package_id 指定被比较的原评审包"
+            )
+        include_unchanged = (query.get("include_unchanged", [""])[0] in ("1", "true", "yes"))
+        self._send_json(
+            200,
+            self.services.packages.build_package_diff(
+                actor,
+                target_package_id=package_id,
+                base_package_id=base_values[0].strip(),
+                include_unchanged=include_unchanged,
+            ),
+        )
+
     def add_entry(self, package_id: str) -> None:
         actor = self._actor()
         body = self._read_json()
@@ -419,6 +443,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/versions/{version_id}", "get_version"),
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
+        ("/v1/packages/{package_id}/diff", "diff_package"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",

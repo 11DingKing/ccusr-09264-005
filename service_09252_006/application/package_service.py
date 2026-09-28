@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from ..domain.disclosure import DisclosureContext, redact_entry
+from ..domain.diff import diff_packages
 from ..domain.enums import PackageStatus, Role
 from ..domain.errors import (
     ConflictError,
@@ -326,6 +327,130 @@ class PackageService(Service):
         else:
             packages = self.repo.list_packages(actor.institution_id)
         return [self._package_dict(p) for p in packages]
+
+    # ------------------------------------------------- 复审包差异（只读）
+    def build_package_diff(
+        self,
+        actor: User,
+        *,
+        target_package_id: str,
+        base_package_id: str,
+        include_unchanged: bool = False,
+    ) -> dict:
+        """逐字段比较两个评审包的封存清单。
+
+        只读用例：仅执行 SELECT（条目 JOIN versions 关联来源版本），
+        不开启写事务、不写审计、不改变任何状态，因此【不会触发新的复审
+        任务】。鉴权与最小披露规则与包视图一致；两个包必须位于同一
+        复审链上（一方 supersedes 另一方）。
+        """
+        target = self.repo.get_package(target_package_id)
+        if target is None:
+            raise NotFoundError(
+                "复审包不存在", details={"package_id": target_package_id}
+            )
+        base = self.repo.get_package(base_package_id)
+        if base is None:
+            raise NotFoundError(
+                "原评审包不存在", details={"package_id": base_package_id}
+            )
+
+        if not (
+            target.supersedes_package_id == base.package_id
+            or base.supersedes_package_id == target.package_id
+        ):
+            raise ValidationError(
+                "只能比较同一复审链上的两个评审包",
+                details={
+                    "base_package_id": base.package_id,
+                    "target_package_id": target.package_id,
+                },
+            )
+
+        for pkg in (base, target):
+            self._assert_can_view(actor, pkg)
+
+        base_snaps = self.repo.list_entry_snapshots(base.package_id)
+        target_snaps = self.repo.list_entry_snapshots(target.package_id)
+        result = diff_packages(
+            base,
+            target,
+            base_snapshots=base_snaps,
+            target_snapshots=target_snaps,
+            include_unchanged=include_unchanged,
+        )
+
+        active = {
+            r.package_id
+            for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
+        }
+        ctx = DisclosureContext(actor, active)
+        snaps_by_pkg = {
+            base.package_id: {
+                (s.material_id, s.version_id): s for s in base_snaps
+            },
+            target.package_id: {
+                (s.material_id, s.version_id): s for s in target_snaps
+            },
+        }
+        pkgs_by_id = {base.package_id: base, target.package_id: target}
+        for entry_diff in result["entries"]:
+            self._redact_diff_entry(
+                ctx, entry_diff, snaps_by_pkg, pkgs_by_id
+            )
+        result["viewer"] = actor.user_id
+        return result
+
+    def _assert_can_view(self, actor: User, package: ReviewPackage) -> None:
+        is_assigned = (
+            actor.has_role(Role.REVIEWER)
+            and any(
+                r.reviewer_id == actor.user_id
+                for r in self.repo.list_requests_by_package(package.package_id)
+            )
+        )
+        if (
+            actor.institution_id != package.institution_id
+            and not actor.has_role(Role.QUALITY_AUTHORITY)
+            and not actor.has_role(Role.AUDITOR)
+            and not is_assigned
+        ):
+            raise PermissionDeniedError("不能查看其他机构评审包")
+
+    @staticmethod
+    def _redact_diff_entry(
+        ctx: DisclosureContext,
+        entry_diff: dict,
+        snaps_by_pkg: dict[str, dict[tuple[str, str], object]],
+        pkgs_by_id: dict[str, ReviewPackage],
+    ) -> None:
+        """对差异两侧分别做最小披露；任一侧不可见即遮蔽 sha256 字段值。"""
+        redacted = False
+        for side in ("base", "target"):
+            ref = entry_diff[side]
+            if ref is None:
+                continue
+            pkg = pkgs_by_id[ref["package_id"]]
+            snap = snaps_by_pkg[ref["package_id"]].get(
+                (ref["material_id"], ref["version_id"])
+            )
+            if snap is None or not ctx.can_see_entry(snap, pkg):
+                redacted = True
+                if ref.get("sha256") is not None:
+                    ref["sha256"] = None
+                    ref["sha256_redacted"] = True
+        if redacted:
+            for change in entry_diff["changes"]:
+                if change["field"] == "sha256":
+                    if change["base"] is not None:
+                        change["base"] = None
+                        change["base_redacted"] = True
+                    if change["target"] is not None:
+                        change["target"] = None
+                        change["target_redacted"] = True
+            entry_diff["redacted"] = True
+        else:
+            entry_diff["redacted"] = False
 
     @staticmethod
     def _package_dict(p: ReviewPackage, *, replayed: bool = False) -> dict:

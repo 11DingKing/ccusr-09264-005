@@ -18,6 +18,7 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EntryVersionSnapshot,
     Material,
     MaterialVersion,
     Objection,
@@ -483,6 +484,26 @@ class SqliteRepository(Repository):
         ).fetchone()
         return row is not None
 
+    def list_entry_snapshots(
+        self, package_id: str
+    ) -> list[EntryVersionSnapshot]:
+        # 只读查询（不开启事务）：清单条目关联 versions 来源版本快照，
+        # 供复审包差异计算；JOIN 不产生任何写入。
+        rows = self._conn.execute(
+            """
+            SELECT e.entry_id, e.package_id, e.material_id, e.version_id,
+                   e.sha256, e.kind, e.sensitivity, e.added_at,
+                   v.version_no, v.media_type, v.size,
+                   v.withdrawn AS version_withdrawn
+            FROM entries e
+            JOIN versions v ON v.version_id = e.version_id
+            WHERE e.package_id = ?
+            ORDER BY e.material_id, e.version_id
+            """,
+            (package_id,),
+        ).fetchall()
+        return [_row_to_entry_snapshot(r) for r in rows]
+
     def transition_package_status(
         self,
         package_id: str,
@@ -716,4 +737,21 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_entry_snapshot(row: sqlite3.Row) -> EntryVersionSnapshot:
+    return EntryVersionSnapshot(
+        entry_id=row["entry_id"],
+        package_id=row["package_id"],
+        material_id=row["material_id"],
+        version_id=row["version_id"],
+        sha256=row["sha256"],
+        kind=row["kind"],
+        sensitivity=row["sensitivity"],
+        added_at=row["added_at"],
+        version_no=row["version_no"],
+        media_type=row["media_type"],
+        size=row["size"],
+        version_withdrawn=bool(row["version_withdrawn"]),
     )

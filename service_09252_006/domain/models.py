@@ -78,6 +78,16 @@ class PackageEntry:
 
 
 @dataclass
+class EntryVersionSnapshot(PackageEntry):
+    """清单条目关联 versions 表后的只读快照（差异比较用）。"""
+
+    version_no: int
+    media_type: str
+    size: int
+    version_withdrawn: bool           # 该版本当前是否已撤回（历史条目标记用）
+
+
+@dataclass
 class ReviewPackage:
     package_id: str
     institution_id: str
